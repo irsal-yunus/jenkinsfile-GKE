@@ -1,0 +1,190 @@
+def project = "bri-embrio-dev"
+def appName = 'web-admin'
+def namespace = "bri-invest"
+def proxyType = "http"
+def proxyPort = "1707"
+
+pipeline {
+  agent {
+    kubernetes {
+      defaultContainer 'jnlp'
+      yaml """
+        apiVersion: v1
+        kind: Pod
+        metadata:
+        labels:
+          component: ci
+        spec:
+          tolerations:
+          - key: "jenkins"
+            operator: "Equal"
+            value: "agent"
+            effect: "NoSchedule"
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+               - preference:
+                   matchExpressions:
+                   - key: jenkins
+                     operator: In
+                     values:
+                     - agent
+                 weight: 100
+          serviceAccountName: cd-jenkins
+          containers:
+          - name: gcloud
+            image: google/cloud-sdk:263.0.0-alpine
+            imagePullPolicy: IfNotPresent
+            command:
+            - cat
+            tty: true
+          - name: helm
+            image: alpine/helm:2.14.0
+            imagePullPolicy: IfNotPresent
+            command:
+            - cat
+            tty: true
+          - name: jnlp
+            image: mfahry/bri-jnlp-slave:1.7
+            imagePullPolicy: IfNotPresent
+            resources:
+              limits:
+                memory: "1Gi"
+                cpu: "1"
+        """
+    }
+  }
+  
+  stages {
+    stage('Quality Node') {
+      options {
+        timeout(time: 1, unit: 'HOURS')   // timeout on this stage
+      }
+      when {
+         branch 'develop'
+       }
+      environment {
+        scannerHome = tool 'sonarscanner'
+      }
+      steps {
+        script {
+        try {
+        withSonarQubeEnv('sonarqube') {
+          sh "${scannerHome}/bin/sonar-scanner -X"
+           }
+        }
+        catch (err) {
+                echo 'Application Scanned'
+        }
+      }
+    }
+    }
+      stage("Unit Test") {
+        when {
+         branch 'develop'
+       }
+        steps {
+          // container("node") {
+          //   sh "yarn test"          
+          // }
+          sh "echo Skip this processing ..."
+        }
+      }
+    stage("build image") {
+      environment {
+        IMAGE_REPO = "gcr.io/${project}/${appName}"
+        IMAGE_TAG = "${env.GIT_COMMIT.substring(0,7)}"
+        proxyAddress = "${env.BRANCH_NAME == 'master' ? '172.18.104.221' : '172.18.104.20'}"
+      }  
+      steps {
+        container("gcloud") {
+          // sh "PYTHONUNBUFFERED=1 gcloud builds submit -t ${IMAGE_REPO}:${IMAGE_TAG} ."
+        withCredentials([file(credentialsId: "k8s-builder-prod", variable: "JSONKEY")]) {
+            sh "gcloud config set proxy/type ${proxyType}"
+            sh "gcloud config set proxy/address ${proxyAddress}"
+            sh "gcloud config set proxy/port ${proxyPort}"
+
+            sh "cat ${JSONKEY} >> key.json"
+            sh "gcloud auth activate-service-account --key-file=key.json"
+            sh "gcloud builds submit --project ${project} --tag ${IMAGE_REPO}:${IMAGE_TAG} ."
+          }
+        }
+      }
+    }
+    stage("Deploy to development") {
+       when {
+         branch 'develop'
+       }
+      environment {
+        IMAGE_REPO = "gcr.io/${project}/${appName}"
+        IMAGE_TAG = "${env.GIT_COMMIT.substring(0,7)}"
+      }
+      steps {
+        container("helm") {
+          //  sh "helm upgrade --debug --install -f helm/values.dev.yml --set-string image.repository=${IMAGE_REPO},image.tag=${IMAGE_TAG} ms-dgb-dashboard ./helm/ms-dgb-dashboard"
+        withCredentials([file(credentialsId: "kubeconfig", variable: "KUBECONFIG")]) {
+            // setup kube config
+            sh "mkdir -p ~/.kube/"
+            sh "cat ${KUBECONFIG} >> ~/.kube/config"
+            
+            sh """
+              helm upgrade ${appName} ./helm/${appName} \
+                --set-string image.repository=${IMAGE_REPO},image.tag=${IMAGE_TAG} \
+                -f ./helm/values.dev.yml --debug --install --namespace ${namespace}
+            """
+          }       
+        }
+      }
+    }  
+    stage("Deploy to production") {
+      when {
+        branch 'master'
+      }
+      environment {
+        IMAGE_REPO = "gcr.io/${project}/${appName}"
+        IMAGE_TAG = "${env.GIT_COMMIT.substring(0,7)}"
+      }
+      steps {
+        container("helm") {
+        // sh "helm upgrade --debug --install -f helm/values.prd.yml --set-string image.repository=${IMAGE_REPO},image.tag=${IMAGE_TAG} ms-dgb-dashboard ./helm/ms-dgb-dashboard"
+        withCredentials([file(credentialsId: "kubeconfig", variable: "KUBECONFIG")]) {
+            // setup kube config
+            sh "mkdir -p ~/.kube/"
+            sh "cat ${KUBECONFIG} >> ~/.kube/config"
+            
+            sh """
+              helm upgrade ${appName} ./helm/${appName} \
+                --set-string image.repository=${IMAGE_REPO},image.tag=${IMAGE_TAG} \
+                -f ./helm/values.prd.yml --debug --install --namespace ${namespace}
+            """
+            }
+          }
+        }
+      }
+    stage("Deploy to uat") {
+      when {
+        branch 'uat'
+      }
+      environment {
+        IMAGE_REPO = "gcr.io/${project}/${appName}"
+        IMAGE_TAG = "${env.GIT_COMMIT.substring(0,7)}"
+      }
+      steps {
+        container("helm") {
+        // sh "helm upgrade --debug --install -f helm/values.prd.yml --set-string image.repository=${IMAGE_REPO},image.tag=${IMAGE_TAG} ms-dgb-dashboard ./helm/ms-dgb-dashboard"
+        withCredentials([file(credentialsId: "kubeconfig", variable: "KUBECONFIG")]) {
+            // setup kube config
+            sh "mkdir -p ~/.kube/"
+            sh "cat ${KUBECONFIG} >> ~/.kube/config"
+            
+            sh """
+              helm upgrade ${appName}-uat ./helm/ms-matt-trakker \
+                --set-string image.repository=${IMAGE_REPO},image.tag=${IMAGE_TAG} \
+                -f ./helm/values.uat.yml --debug --install --namespace ${namespaceuat}
+            """
+            }
+          }
+        }
+      }
+    }
+  }
